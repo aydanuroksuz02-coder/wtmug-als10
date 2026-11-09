@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b57d0">
+  <title>ALŞ09 – Hoca / Öğrenci</title>
+  <link rel="manifest" href="../manifest.webmanifest">
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script src="https://unpkg.com/jsqr@1.4.0/dist/jsQR.js"></script>
+  <style>
+    body { font-family:system-ui; margin:0; padding:16px; max-width:720px;
+           margin-left:auto; margin-right:auto; }
+    .hidden { display:none !important; }
+    .top { display:flex; justify-content:space-between; align-items:center; }
+    .top a { color:#0b57d0; text-decoration:none; font-weight:600; }
+    .card { padding:20px; border-radius:16px; background:#e8f0fe;
+            margin:8px 0; font-weight:600; cursor:pointer; text-align:center;
+            color:#0b57d0; }
+    .card:active { transform: scale(.98); }
+    #log { background:#111; color:#0f0; font-family:monospace; padding:12px;
+           height:240px; overflow:auto; border-radius:8px; font-size:.85rem; }
+    input[type=text] { padding:10px; border-radius:8px; border:1px solid #ccc;
+                       width:100%; box-sizing:border-box; }
+    button, label.btn { padding:10px 14px; border-radius:8px; border:none;
+                        background:#0b57d0; color:#fff; font-weight:600;
+                        cursor:pointer; display:inline-block; margin-top:6px; }
+    progress { width:100%; height:18px; }
+    #autoInfo { color: #0a7c2e; font-weight: 600; }
+    video { width:100%; border-radius:12px; margin-top: 8px; }
+    #downloadBtn { background: #0a7c2e; text-decoration:none; color: #fff;
+                   padding: 10px 14px; border-radius: 8px; display: inline-block;
+                   margin-top: 8px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <h1 style="margin:0;">ALŞ09</h1>
+    <a href="../index.html">← Ana ekran</a>
+  </div>
+
+  <!-- ROL SEÇİMİ -->
+  <section id="roles">
+    <p>Rol seçin:</p>
+    <div class="card" data-role="hoca">👨‍🏫 Hoca (Dosya Gönderici)</div>
+    <div class="card" data-role="ogrenci">🎓 Öğrenci (Dosya Alıcı)</div>
+  </section>
+
+  <!-- HOCA -->
+  <section id="hoca" class="hidden">
+    <h2>Hoca Modu</h2>
+    <label class="btn" for="fileSel">📎 Gönderilecek dosyayı seç</label>
+    <input type="file" id="fileSel" hidden>
+    <p id="selectedInfo"></p>
+    <canvas id="qr" style="margin:16px auto;display:block"></canvas>
+    <p>ID: <code id="hocaId">—</code></p>
+    <p>Bağlı öğrenci: <b id="peerCount">0</b></p>
+    <div id="log"></div>
+  </section>
+
+  <!-- ÖĞRENCİ -->
+  <section id="ogrenci" class="hidden">
+    <h2>Öğrenci Modu</h2>
+    <p id="autoInfo"></p>
+    <input type="text" id="hocaIdInput" placeholder="Hoca ID girin">
+    <button id="connectBtn">Bağlan</button>
+    <button id="scanBtn" class="hidden">📷 Kamera ile QR Okut</button>
+    <video id="cam" autoplay playsinline muted hidden></video>
+    <canvas id="qrframe" hidden></canvas>
+
+    <div id="progressWrap" class="hidden">
+      <progress id="prog" value="0" max="100"></progress>
+      <p id="progText"></p>
+    </div>
+    <a id="downloadBtn" class="hidden" href="#" download>💾 İndir</a>
+  </section>
+
+  <script type="module">
+    import { consumePendingId, parseIdFromQr } from '../shared/bridge.js';
+    import { isMobileDevice } from '../shared/utils.js';
+
+    const $ = id => document.getElementById(id);
+    const CHUNK = 16 * 1024;
+
+    let peer, conn;
+    let pendingFile = null;
+    let incomingChunks = [];
+    let incomingMeta = null;
+    const peerConns = new Map();
+
+    /* ---------- ROL SEÇİMİ ---------- */
+    $('roles').addEventListener('click', e => {
+      const card = e.target.closest('[data-role]');
+      if (!card) return;
+      $('roles').classList.add('hidden');
+      if (card.dataset.role === 'hoca') startHoca();
+      else startOgrenci();
+    });
+
+    /* ---------- HOCA ---------- */
+    function startHoca() {
+      $('hoca').classList.remove('hidden');
+      $('fileSel').onchange = () => {
+        const f = $('fileSel').files[0];
+        if (!f) return;
+        pendingFile = f;
+        $('selectedInfo').textContent = `Seçildi: ${f.name} (${(f.size/1024/1024).toFixed(2)} MB)`;
+        if (peer) return;
+
+        peer = new Peer({ debug: 2 });
+        peer.on('open', id => {
+          $('hocaId').textContent = id;
+          QRCode.toCanvas($('qr'), `als10://id=${id}&role=hoca`, { width: 220 },
+            err => err && console.error(err));
+          logLine(`Hoca hazır. ID: ${id}`);
+        });
+        peer.on('connection', c => {
+          peerConns.set(c.peer, c);
+          $('peerCount').textContent = peerConns.size;
+          logLine(`Öğrenci bağlandı: ${c.peer}`);
+          if (pendingFile) sendFileTo(c, pendingFile);
+          c.on('close', () => {
+            peerConns.delete(c.peer);
+            $('peerCount').textContent = peerConns.size;
+            logLine(`Ayrıldı: ${c.peer}`);
+          });
+        });
+        peer.on('error', err => logLine(`Hata: ${err.type}`));
+      };
+    }
+
+    function logLine(t) {
+      const l = $('log');
+      const d = document.createElement('div');
+      d.textContent = `[${new Date().toLocaleTimeString()}] ${t}`;
+      l.append(d);
+      l.scrollTop = l.scrollHeight;
+    }
+
+    async function sendFileTo(c, file) {
+      const id = crypto.randomUUID();
+      c.send({ type: 'file-start', id, name: file.name, mime: file.type, size: file.size });
+      const reader = file.stream().getReader();
+      let sent = 0;
+      logLine(`${c.peer} → başladı: ${file.name}`);
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        for (let off = 0; off < value.byteLength; off += CHUNK) {
+          c.send({ type: 'file-chunk', id, data: value.subarray(off, off + CHUNK) });
+          sent += Math.min(CHUNK, value.byteLength - off);
+        }
+        logLine(`${c.peer} → %${Math.round(sent / file.size * 100)}`);
+      }
+      c.send({ type: 'file-end', id });
+      logLine(`${c.peer} → tamamlandı: ${file.name}`);
+    }
+
+    /* ---------- ÖĞRENCİ ---------- */
+    function startOgrenci() {
+      $('ogrenci').classList.remove('hidden');
+      if (isMobileDevice()) $('scanBtn').classList.remove('hidden');
+
+      // KRİTİK: Köprüde bekleyen ID var mı?
+      const pending = consumePendingId();
+      if (pending?.id) {
+        $('hocaIdInput').value = pending.id;
+        $('autoInfo').textContent = `✅ QR'dan otomatik alındı: ${pending.id}`;
+        setTimeout(() => connectAsStudent(pending.id), 300);
+      }
+    }
+
+    $('connectBtn').onclick = () => {
+      const id = $('hocaIdInput').value.trim();
+      if (id) connectAsStudent(id);
+    };
+
+    $('scanBtn').onclick = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment' }
+        });
+        $('cam').srcObject = stream;
+        $('cam').hidden = false;
+        requestAnimationFrame(tick);
+      } catch (e) {
+        alert('Kamera açılamadı: ' + e.message);
+      }
+    };
+
+    function tick() {
+      const cam = $('cam'), frame = $('qrframe');
+      if (cam.readyState < 2) return requestAnimationFrame(tick);
+      if (frame.width !== cam.videoWidth) {
+        frame.width = cam.videoWidth; frame.height = cam.videoHeight;
+      }
+      const ctx = frame.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(cam, 0, 0);
+      const img = ctx.getImageData(0, 0, frame.width, frame.height);
+      const code = jsQR(img.data, img.width, img.height);
+      if (code) {
+        const id = parseIdFromQr(code.data);
+        if (id) {
+          cam.srcObject.getTracks().forEach(t => t.stop());
+          cam.hidden = true;
+          $('hocaIdInput').value = id;
+          connectAsStudent(id);
+          return;
+        }
+      }
+      requestAnimationFrame(tick);
+    }
+
+    function connectAsStudent(id) {
+      if (peer) return;
+      peer = new Peer({ debug: 2 });
+      peer.on('open', () => {
+        conn = peer.connect(id, { reliable: true });
+        conn.on('open', () => {
+          $('autoInfo').textContent = `✅ Bağlı: ${id}`;
+        });
+        conn.on('data', data => {
+          if (typeof data !== 'object') return;
+          if (data.type === 'file-start') {
+            incomingMeta = data;
+            incomingChunks = [];
+            $('progressWrap').classList.remove('hidden');
+            $('prog').value = 0;
+            $('progText').textContent = `Alınıyor: ${data.name}`;
+            $('downloadBtn').classList.add('hidden');
+          } else if (data.type === 'file-chunk') {
+            incomingChunks.push(data.data);
+            const recv = incomingChunks.reduce((s, c) => s + c.byteLength, 0);
+            $('prog').value = Math.round(recv / incomingMeta.size * 100);
+            $('progText').textContent =
+              `Alınıyor: ${incomingMeta.name} — %${$('prog').value}`;
+          } else if (data.type === 'file-end') {
+            const blob = new Blob(incomingChunks, { type: incomingMeta.mime });
+            const url = URL.createObjectURL(blob);
+            const dl = $('downloadBtn');
+            dl.href = url;
+            dl.download = incomingMeta.name;
+            dl.classList.remove('hidden');
+            $('progText').textContent = `✅ ${incomingMeta.name} alındı (${(blob.size/1024).toFixed(1)} KB)`;
+          }
+        });
+      });
+      peer.on('error', err => {
+        $('autoInfo').textContent = 'Bağlantı hatası: ' + err.type;
+      });
+    }
+  </script>
+</body>
+</html>
